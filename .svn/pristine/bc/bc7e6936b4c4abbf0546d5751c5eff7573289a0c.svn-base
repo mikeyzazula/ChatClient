@@ -1,0 +1,572 @@
+/* built off demo server lab */
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <inttypes.h>
+#include <time.h>
+
+//Structs
+struct Participant{
+	int sd,connected;
+	char username[11];
+	time_t timeout;
+};
+struct Observer{
+	int sd,connected;
+	char username[11];
+	time_t timeout;
+};
+
+//#defines
+#define QLEN 6 /* size of request queue */
+#define MAX 255 // max number of clients or observers we can have
+#define TRUE  1
+#define FALSE  0
+//fucntions
+void initialize_arrays();
+void addto_participants(int sd);
+void addto_observers(int sd);
+int name_check(char* username, int length,int psd);
+int name_check_observer(char* username, int length,int osd);
+void get_message(int psd, uint16_t message_length);
+void close_part(int sd, int index);
+void close_obsv(int sd, int index);
+void timeout_check();
+void public_message(char* output);
+int private_message(char* output,char* receiver, struct Participant sender);
+int build_message(struct Participant sender,char* message);
+
+//Globals
+struct Participant participants[255];
+struct Observer observers[255];
+
+int main(int argc, char **argv) {
+	struct protoent *ptrp; /* pointer to a protocol table entry */
+	struct sockaddr_in psad; /* structure to hold server's address */
+	struct sockaddr_in osad; /* structure to hold server's address */
+	struct sockaddr_in cad; /* structure to hold client's address */
+	int p_sd,o_sd,osd,psd ,psd2,osd2, max,p_temp,o_temp; /* socket descriptors */
+	int obsv_port; /* obsver port number */
+  int part_port; /* participant port number */
+	int retval; /*variable to check for activity for select */
+	int recvp,recvo; /* holding the amount we receive in our recv calls */
+	int alenp; /* length of address */
+	int aleno; /* length of address */
+	int optval = 1; /* boolean value when we set socket option */
+	char pbuff[1024]; /* buffer for participant operations */
+	char obuff[1024]; /* buffer for observer operations */
+	char readbuff[65535]; /* reading in messages */
+	struct timeval tv;
+	tv.tv_sec = 1;
+	tv.tv_usec = 0;
+	if( argc != 3 ) {
+		fprintf(stderr,"Error: Wrong number of arguments\n");
+		fprintf(stderr,"usage:\n");
+		fprintf(stderr,"./server server_port\n");
+		exit(EXIT_FAILURE);
+	}
+	/* creating read set*/
+  fd_set readfds;
+	initialize_arrays();
+	memset((char *)&psad,0,sizeof(psad)); /* clear sockaddr structure */
+	psad.sin_family = AF_INET; /* set family to Internet */
+	psad.sin_addr.s_addr = INADDR_ANY; /* set the local IP address */
+	memset((char *)&osad,0,sizeof(osad)); /* clear sockaddr structure */
+	osad.sin_family = AF_INET; /* set family to Internet */
+	osad.sin_addr.s_addr = INADDR_ANY; /* set the local IP address */
+
+/* participant port check */
+  part_port = atoi(argv[1]); /* convert argument to binary */
+	if (part_port > 0) { /* test for illegal value */
+		psad.sin_port = htons((u_short)part_port);
+	} else { /* print error message and exit */
+		fprintf(stderr,"Error: Bad port number %s\n",argv[1]);
+		exit(EXIT_FAILURE);
+	}
+
+  /* observer port check */
+  obsv_port = atoi(argv[2]); /* convert argument to binary */
+  if (obsv_port > 0) { /* test for illegal value */
+    osad.sin_port = htons((u_short)obsv_port);
+  } else { /* print error message and exit */
+    fprintf(stderr,"Error: Bad port number %s\n",argv[2]);
+    exit(EXIT_FAILURE);
+  }
+
+	/* Map TCP transport protocol name to protocol number */
+	if ( ((long int)(ptrp = getprotobyname("tcp"))) == 0) {
+		fprintf(stderr, "Error: Cannot map \"tcp\" to protocol number");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Create a participant socket */
+	p_sd = socket(PF_INET, SOCK_STREAM, ptrp->p_proto);
+	if (p_sd < 0) {
+		fprintf(stderr, "Error: Socket creation failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Allow reuse of participant port - avoid "Bind failed" issues */
+	if( setsockopt(p_sd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0 ) {
+		fprintf(stderr, "Error Setting socket option failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Bind a local address to the participant socket */
+	if (bind(p_sd, (struct sockaddr *)&psad, sizeof(psad)) < 0) {
+		fprintf(stderr,"Error: Bind failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Specify size of request queue */
+	if (listen(p_sd, QLEN) < 0) {
+		fprintf(stderr,"Error: Listen failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Create an observer socket */
+	o_sd = socket(PF_INET, SOCK_STREAM, ptrp->p_proto);
+	if (o_sd < 0) {
+		fprintf(stderr, "Error: Socket creation failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Allow reuse of observer port - avoid "Bind failed" issues */
+	if( setsockopt(o_sd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0 ) {
+		fprintf(stderr, "Error Setting socket option failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Bind a local address to the participant socket */
+	if (bind(o_sd, (struct sockaddr *)&osad, sizeof(osad)) < 0) {
+		fprintf(stderr,"Error: Bind failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Specify size of request queue */
+	if (listen(o_sd, QLEN) < 0) {
+		fprintf(stderr,"Error: Listen failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+
+	/* Main server loop - accept and handle requests */
+	while (1) {
+		// zeroes out the read set after each loop
+		FD_ZERO(&readfds);
+
+		// adding our sockets and getting the max socket
+		FD_SET(p_sd, &readfds);
+		FD_SET(o_sd, &readfds);
+		max = p_sd;
+		if(max < o_sd){
+			max = o_sd;
+		}
+		for(int i = 0; i < MAX; i++){
+			p_temp = participants[i].sd;
+			o_temp = observers[i].sd;
+			//if the socket is used, add it to the read set
+			if(p_temp > 0){
+				FD_SET(p_temp,&readfds);
+				//printf("adding ptemp %d\n",p_temp );
+			}
+			if(o_temp > 0){
+				FD_SET(o_temp,&readfds);
+				//printf("adding otemp %d\n",o_temp );
+			}
+			if( max <= o_temp){
+				max = o_temp;
+			}
+			if( max < p_temp){
+				max = p_temp;
+			}
+		}
+
+		retval = select(max+1, &readfds,NULL,NULL,&tv);
+		//we timeout every second, then run a check to see if anyone's time has expired
+		timeout_check();
+		if(retval > 0){
+			printf("select status %d\n",retval );
+		}
+		if(FD_ISSET(p_sd,&readfds)){
+			alenp = sizeof(psad);
+			if ( (psd2=accept(p_sd, (struct sockaddr *)&psad, &alenp)) < 0) {
+				fprintf(stderr, "Error: Accept failed\n");
+				exit(EXIT_FAILURE);
+			}
+			//inform user of socket number - used in send and receive commands
+		//	printf("New particpant connection , socket fd is %d , ip is : %s , port : %d \n" , psd2 , inet_ntoa(psad.sin_addr) , ntohs(psad.sin_port));
+			 addto_participants(psd2);
+
+			//add to array
+		}
+		if(FD_ISSET(o_sd,&readfds)){
+			aleno = sizeof(osad);
+			if ( (osd2=accept(o_sd, (struct sockaddr *)&osad, &aleno)) < 0) {
+				fprintf(stderr, "Error: Accept failed\n");
+				exit(EXIT_FAILURE);
+
+			}
+			//inform user of socket number - used in send and receive commands
+			//printf("New observer connection , socket fd is %d , ip is : %s , port : %d \n" , osd2 , inet_ntoa(osad.sin_addr) , ntohs(osad.sin_port));
+			//add to array
+			addto_observers(osd2);
+
+		}
+
+		for(int i = 0; i < MAX; i++){
+			memset(pbuff,0,sizeof(pbuff));
+			memset(obuff,0,sizeof(obuff));
+
+			memset(readbuff,0,sizeof(readbuff));
+			psd = participants[i].sd;
+			osd = observers[i].sd;
+			if(FD_ISSET(psd,&readfds)){
+				//if the username is blank, we know it's a new user
+				if(strcmp("",participants[i].username) == 0){
+					uint8_t length;
+					read(psd,pbuff,1);
+					length = pbuff[0];
+					printf("length of name %d\n",length );
+					//if clause in case the user ctrl + c'd out at entering username
+					if(length == 0){
+						close_part(participants[i].sd,i);
+					}
+					//else proceed normally
+					else{
+						char newname[length+1];
+						read(psd,newname,length);
+						newname[length] = '\0';
+						int name_bool = name_check(newname,length,psd);
+						printf("name bool value %d\n",name_bool );
+						if(name_bool == 1){
+							strcpy(participants[i].username,newname);
+							printf("added  %s to participant %d\n",participants[i].username,i);
+						}
+					}
+
+				}
+				//else we know that the user either disconnected or has a message
+					else{
+						uint16_t message_length;
+						int readval = read(psd,&message_length,2);
+						printf("readbuff: %d\n",readbuff[0] );
+						//user has disconnected,so we clean out there settings
+						if(readval == 0){
+							dprintf(2,"close host\n");
+							close_part(psd,i);
+						}
+						else{
+							//else, we got a message from them
+							//uint16_t message_length = readbuff[0] +readbuff[1]; //?
+							printf("message_length: %d\n",message_length );
+							uint16_t convert_len = ntohs(message_length);
+							printf("convert_len: %d\n",convert_len );
+							//if the message was too big, get rid of them
+							if(convert_len > 1000){
+								for(int j =0; j < MAX; j++){
+									if(strcmp(observers[j].username,participants[i].username) == 0){
+										close_obsv(observers[j].sd,j);
+									}
+								}
+								close_part(participants[i].sd,i);
+							}
+
+							else{
+								dprintf(2,"size of the word %d\n",convert_len );
+								read(psd, readbuff,convert_len);
+								readbuff[convert_len] = '\0';
+								printf("readbuff: %s\n",readbuff );
+								build_message(participants[i],readbuff);
+								memset(readbuff, 0, sizeof(readbuff));
+							}
+						}
+					}
+				}
+
+	/// end participant protocol /////
+
+
+/// observer protocol////
+			if(FD_ISSET(osd,&readfds)){
+				//if the username is blank, we know it's a new observer
+				if(strcmp("",observers[i].username) == 0){
+					uint8_t length;
+					read(osd,&length,1);
+					printf("length of name %d\n",length );
+					if(length == 0){
+						close_obsv(observers[i].sd,i);
+					}
+					else{
+						char newname[length+1];
+						read(osd,newname,length);
+						newname[length] = '\0';
+						int name_bool = name_check_observer(newname,length,osd);
+						printf("name bool value %d\n",name_bool );
+						if(name_bool == 1){
+							strcpy(observers[i].username,newname);
+							printf("added  %s to observer %d\n",observers[i].username,i);
+						}
+					}
+
+				}
+				//the only other activity is disconnecting
+				else{
+					close_obsv(osd,i);
+				}
+			}
+		}
+	}
+}
+/// end observer ///
+
+
+void get_message(int psd, uint16_t message_length){
+	char message[message_length+1];
+	int readval =read(psd,message+1,message_length);
+	message[message_length] = '\0';
+	printf("message_length: %d message: %s readval: %d\n",message_length, message, readval );
+}
+
+int name_check(char* username, int length,int psd){
+	char newcheck = 'I';
+	for(int i = 0; i < length; i++){
+		if(!(isdigit(username[i]) || isalpha(username[i]) || username[i] == '_')){
+			send(psd,&newcheck,1,0);
+			return 3;
+		}
+	}
+	for(int i = 0; i < MAX; i++){
+		if(strcmp(username,participants[i].username) == 0){
+			newcheck = 'T';
+			send(psd,&newcheck,1,MSG_DONTWAIT);
+			return 2;
+		}
+	}
+	newcheck = 'Y';
+	send(psd,&newcheck,1,0);
+	return 1;
+}
+
+void close_part(int sd, int index){
+	char output[1014];
+	sprintf(output,"User %s has left the room\n",participants[index].username); //needs to be sent to obsv
+	public_message(output);
+	for(int i = 0; i < MAX; i++){
+		if(strcmp(observers[i].username,participants[index].username) == 0 && observers[i].connected == 1){
+			close_obsv(observers[i].sd,i);
+		}
+	}
+	participants[index].sd = 0;
+	participants[index].connected = 0;
+	strcpy(participants[index].username,"");
+	participants[index].timeout = time(NULL);
+	//close obsv too
+	close(sd);
+}
+int name_check_observer(char* username, int length,int osd){
+	char newcheck = 'N';
+	for(int i = 0; i < MAX; i++){
+		if(strcmp(username,observers[i].username) == 0){
+			newcheck = 'T';
+			observers[i].timeout = time(NULL);
+			send(osd,&newcheck,1,MSG_DONTWAIT);
+			return 2;
+		}
+	}
+	for(int i = 0; i < length; i++){
+		if(strcmp(username,participants[i].username) == 0){
+			newcheck = 'Y';
+			send(osd,&newcheck,1,MSG_DONTWAIT);
+			return 1;
+		}
+	}
+	printf("what the hecky\n" );
+	send(osd,&newcheck,1,MSG_DONTWAIT);
+	return 3;
+}
+
+void close_obsv(int sd, int index){
+	printf("closing obsv\n" );
+	observers[index].sd = 0;
+	observers[index].connected = 0;
+	strcpy(observers[index].username,"");
+	observers[index].timeout = time(NULL);
+	close(sd);
+}
+//finding an open spot to add a new particpant and for observers also, there may be holes we need to fill
+void addto_participants(int sd){
+	char verify = 'N';
+	for(int i = 0; i < MAX; i++ ){
+		if( participants[i].sd == 0 && participants[i].connected == 0){
+			participants[i].sd = sd;
+			participants[i].connected = 1;
+			participants[i].timeout= time(NULL);
+			printf("added particpant with sd %d to position %d time %ld\n",sd, i,participants[i].timeout );
+			verify = 'Y';
+			send(sd,&verify,1,0);
+			break;
+		}
+	}
+	if(verify == 'N'){
+		send(sd,&verify,1,0);
+		close(sd);
+	}
+}
+
+void addto_observers(int sd){
+	char verify = 'N';
+	for(int i = 0; i < MAX; i++ ){
+		if( observers[i].sd == 0 && observers[i].connected == 0){
+			observers[i].sd = sd;
+			observers[i].connected = 1;
+			observers[i].timeout= time(NULL);
+			verify = 'Y';
+			send(sd,&verify,1,0);
+			break;
+		}
+	}
+	if(verify == 'N'){
+		send(sd,&verify,1,0);
+		close(sd);
+	}
+}
+
+//setting our default values
+void initialize_arrays(){
+	for(int i = 0; i < MAX; i++ ){
+		participants[i].sd = 0;
+		participants[i].connected = 0;
+		participants[i].timeout = time(NULL);
+		strcpy(participants[i].username,"");
+		observers[i].sd = 0;
+		observers[i].connected = 0;
+		participants[i].timeout = time(NULL);
+		strcpy(observers[i].username,"");
+	}
+}
+
+int build_message(struct Participant sender,char* message){
+	char output[1014];
+	char first_part[14]; //storing the spaces + name
+	char name[11];
+
+	int diff;
+	int msg_type = 0;
+	if(message[0] == '@'){
+		msg_type = 1;
+	}
+	if(msg_type == 1){
+		memset(name,0,sizeof(name));
+		int pos = 1; //skipping the @
+		while(message[pos] != ' '){
+			name[pos-1] = message[pos];
+			pos++;
+		}
+		message += pos;
+		printf("name: %s\n",name );
+		first_part[0] = '*';
+	}
+	else{
+		first_part[0] = '>';
+	}
+	first_part[1] = ' ';
+	first_part[2] = ' ';
+	int count = 0;
+	for(int i = 3; i < 15; i++){
+		diff = 14- i;
+		if(diff < strlen(sender.username)){
+			first_part[i] = sender.username[count];
+			count++;
+		}
+		else{
+			first_part[i] = ' ';
+		}
+	}
+	sprintf(output,"%s: %s",first_part,message);
+	printf("output: \n%s\n",output );
+
+	if(msg_type ==1){
+		private_message(output,name,sender);
+	}
+	else{
+		public_message(output);
+	}
+	return 1;
+}
+
+//shooting out the messages to observers
+void public_message(char* output){
+	printf("string to send: %s\n",output );
+	uint16_t length = strlen(output);
+	uint16_t convert = htons(length);
+
+	for(int i = 0; i < MAX; i++){
+		if(observers[i].connected == 1){
+			printf("found observer to send to \n" );
+			send(observers[i].sd,&convert,sizeof(convert),0);
+			send(observers[i].sd,output,length,0);
+		}
+	}
+}
+
+//private message to a user
+int private_message(char* output,char* receiver, struct Participant sender){
+	int affil_sd;
+	for(int i = 0; i < MAX; i++){
+		if(observers[i].connected == 1 && strcmp(observers[i].username,receiver) == 0){
+			printf("found observer to send to \n" );
+			uint16_t length = strlen(output);
+			uint16_t convert = htons(length);
+			send(observers[i].sd,&convert,sizeof(convert),0);
+			send(observers[i].sd,output,length,0);
+			return 1;
+		}
+		//good place to look for the senders matching observer incase we dont find the receiver
+		if(strcmp(observers[i].username,sender.username) == 0){
+			affil_sd = observers[i].sd;
+		}
+	}
+	char errormsg[200];
+	sprintf(errormsg,"Warning %s doesn't exist..",receiver);
+	uint16_t length = strlen(errormsg);
+	uint16_t convert = htons(length);
+	send(affil_sd,&convert,sizeof(convert),0);
+	send(affil_sd,errormsg,length,0);
+	return 0;
+
+}
+//removing any users or observers that havent registered a name yet
+void timeout_check(){
+	time_t current_time = time(NULL);
+	int diff;
+	for(int i = 0; i < MAX; i++){
+		if(participants[i].connected == 1){
+			if( strcmp("",participants[i].username) == 0){
+				diff = current_time -participants[i].timeout ;
+				if( diff > 60){
+					printf("user timeout\n" );
+					close_part(participants[i].sd,i);
+				}
+			}
+		}
+		if(observers[i].connected == 1){
+			if( strcmp("",observers[i].username) == 0 ){
+				diff = current_time -observers[i].timeout ;
+				if( diff > 60){
+					printf("user timeout\n" );
+					close_obsv(observers[i].sd,i);
+				}
+			}
+		}
+	}
+}

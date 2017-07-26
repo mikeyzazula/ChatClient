@@ -1,0 +1,351 @@
+/* built off demo server lab */
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <arpa/inet.h>
+#include <ctype.h>
+
+//Structs
+struct Participant{
+	int sd,connected;
+	char username[11];
+	int timeout;
+};
+struct Observer{
+	int sd,connected;
+	char username[11];
+};
+
+//#defines
+#define QLEN 6 /* size of request queue */
+#define MAX 255 // max number of clients or observers we can have
+#define TRUE  1
+#define FALSE  0
+//fucntions
+void initialize_arrays();
+void addto_participants(int sd);
+void addto_observers(int sd);
+int name_check(char* username, int length,int psd);
+//Globals
+struct Participant participants[255];
+struct Observer observers[255];
+
+int main(int argc, char **argv) {
+	struct protoent *ptrp; /* pointer to a protocol table entry */
+	struct sockaddr_in psad; /* structure to hold server's address */
+	struct sockaddr_in osad; /* structure to hold server's address */
+	struct sockaddr_in cad; /* structure to hold client's address */
+	int p_sd,o_sd,osd,psd ,psd2,osd2, max,p_temp,o_temp; /* socket descriptors */
+	int obsv_port; /* obsver port number */
+  int part_port; /* participant port number */
+	int retval; /*variable to check for activity for select */
+	int recvp,recvo; /* holding the amount we receive in our recv calls */
+	int alenp; /* length of address */
+	int aleno; /* length of address */
+	int optval = 1; /* boolean value when we set socket option */
+	char pbuff[1024]; /* buffer for participant operations */
+	char obuff[1024]; /* buffer for observer operations */
+
+	if( argc != 3 ) {
+		fprintf(stderr,"Error: Wrong number of arguments\n");
+		fprintf(stderr,"usage:\n");
+		fprintf(stderr,"./server server_port\n");
+		exit(EXIT_FAILURE);
+	}
+	/* creating read set*/
+  fd_set readfds;
+	initialize_arrays();
+	memset((char *)&psad,0,sizeof(psad)); /* clear sockaddr structure */
+	psad.sin_family = AF_INET; /* set family to Internet */
+	psad.sin_addr.s_addr = INADDR_ANY; /* set the local IP address */
+	memset((char *)&osad,0,sizeof(osad)); /* clear sockaddr structure */
+	osad.sin_family = AF_INET; /* set family to Internet */
+	osad.sin_addr.s_addr = INADDR_ANY; /* set the local IP address */
+
+/* participant port check */
+  part_port = atoi(argv[1]); /* convert argument to binary */
+	if (part_port > 0) { /* test for illegal value */
+		psad.sin_port = htons((u_short)part_port);
+	} else { /* print error message and exit */
+		fprintf(stderr,"Error: Bad port number %s\n",argv[1]);
+		exit(EXIT_FAILURE);
+	}
+
+  /* observer port check */
+  obsv_port = atoi(argv[2]); /* convert argument to binary */
+  if (obsv_port > 0) { /* test for illegal value */
+    osad.sin_port = htons((u_short)obsv_port);
+  } else { /* print error message and exit */
+    fprintf(stderr,"Error: Bad port number %s\n",argv[2]);
+    exit(EXIT_FAILURE);
+  }
+
+	/* Map TCP transport protocol name to protocol number */
+	if ( ((long int)(ptrp = getprotobyname("tcp"))) == 0) {
+		fprintf(stderr, "Error: Cannot map \"tcp\" to protocol number");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Create a participant socket */
+	p_sd = socket(PF_INET, SOCK_STREAM, ptrp->p_proto);
+	if (p_sd < 0) {
+		fprintf(stderr, "Error: Socket creation failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Allow reuse of participant port - avoid "Bind failed" issues */
+	if( setsockopt(p_sd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0 ) {
+		fprintf(stderr, "Error Setting socket option failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Bind a local address to the participant socket */
+	if (bind(p_sd, (struct sockaddr *)&psad, sizeof(psad)) < 0) {
+		fprintf(stderr,"Error: Bind failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Specify size of request queue */
+	if (listen(p_sd, QLEN) < 0) {
+		fprintf(stderr,"Error: Listen failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Create an observer socket */
+	o_sd = socket(PF_INET, SOCK_STREAM, ptrp->p_proto);
+	if (o_sd < 0) {
+		fprintf(stderr, "Error: Socket creation failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Allow reuse of observer port - avoid "Bind failed" issues */
+	if( setsockopt(o_sd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0 ) {
+		fprintf(stderr, "Error Setting socket option failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Bind a local address to the participant socket */
+	if (bind(o_sd, (struct sockaddr *)&osad, sizeof(osad)) < 0) {
+		fprintf(stderr,"Error: Bind failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Specify size of request queue */
+	if (listen(o_sd, QLEN) < 0) {
+		fprintf(stderr,"Error: Listen failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+
+	/* Main server loop - accept and handle requests */
+	while (1) {
+		// zeroes out the read set after each loop
+		FD_ZERO(&readfds);
+
+		// adding our sockets and getting the max socket
+		FD_SET(p_sd, &readfds);
+		FD_SET(o_sd, &readfds);
+		max = p_sd;
+		if(max < o_sd){
+			max = o_sd;
+		}
+		for(int i = 0; i < MAX; i++){
+			p_temp = participants[i].sd;
+			o_temp = observers[i].sd;
+			//if the socket is used, add it to the read set
+			if(p_temp > 0){
+				FD_SET(p_temp,&readfds);
+				printf("adding ptemp %d\n",p_temp );
+			}
+			if(o_temp > 0){
+				FD_SET(o_temp,&readfds);
+				printf("adding otemp %d\n",o_temp );
+
+			}
+			if( max <= o_temp){
+				max = o_temp;
+			}
+			if( max < p_temp){
+				max = p_temp;
+			}
+
+		}
+
+		retval = select(max+1, &readfds,NULL,NULL,NULL);
+		if(retval > 0){
+			printf("%d\n",retval );
+		}
+		if(FD_ISSET(p_sd,&readfds)){
+			alenp = sizeof(psad);
+			if ( (psd2=accept(p_sd, (struct sockaddr *)&psad, &alenp)) < 0) {
+				fprintf(stderr, "Error: Accept failed\n");
+				exit(EXIT_FAILURE);
+			}
+			//inform user of socket number - used in send and receive commands
+		//	printf("New particpant connection , socket fd is %d , ip is : %s , port : %d \n" , psd2 , inet_ntoa(psad.sin_addr) , ntohs(psad.sin_port));
+			 addto_participants(psd2);
+
+			//add to array
+		}
+		if(FD_ISSET(o_sd,&readfds)){
+			aleno = sizeof(osad);
+			if ( (osd2=accept(o_sd, (struct sockaddr *)&osad, &aleno)) < 0) {
+				fprintf(stderr, "Error: Accept failed\n");
+				exit(EXIT_FAILURE);
+
+			}
+			//inform user of socket number - used in send and receive commands
+			//printf("New observer connection , socket fd is %d , ip is : %s , port : %d \n" , osd2 , inet_ntoa(osad.sin_addr) , ntohs(osad.sin_port));
+			//add to array
+			addto_observers(osd2);
+
+		}
+
+		for(int i = 0; i < MAX; i++){
+			memset(pbuff,0,sizeof(pbuff));
+			psd = participants[i].sd;
+			osd = observers[i].sd;
+			// if(participants[i].sd !=0 ){
+			// 	printf("participants at i is: %d\n", participants[i].sd );
+			//
+			// }
+			if(FD_ISSET(psd,&readfds)){
+				//  recvp = recv(psd,pbuff,sizeof(pbuff),MSG_DONTWAIT);
+				// if(recvp <= 0){
+				// 	printf("Host disconnected\n");
+				// 	participants[i].sd = 0;
+				// 	close(psd);
+				// }
+				// if(recvp > 0){
+				// 	printf("we got: %s\n",pbuff );
+				// }
+
+				//if the username is blank, we know it's a new user
+				if(strcmp("",participants[i].username) == 0){
+					printf("hellow\n" );
+					uint8_t length;
+					read(psd,pbuff,1);
+					length = pbuff[0];
+					printf("length of name %d\n",length );
+					char newname[length];
+					read(psd,newname,length);
+					int name_bool = name_check(newname,length,psd);
+					printf("name bool value %d\n",name_bool );
+					if(name_bool == TRUE){
+						strcpy(participants[i].username,newname);
+						printf("added this guy %s to participant %d",participants[i].username,i);
+					}
+				}
+				else{
+					char *readbuff = malloc(1024);
+					int bytesrecived = read(psd,readbuff,sizeof(readbuff));
+					if(bytesrecived == 0){
+						printf("User %s has left the room\n",participants[i].username);
+						participants[i].sd = 0;
+						participants[i].connected = 0;
+						strcpy(participants[i].username,"");
+						close(psd);
+					}
+				}
+
+
+
+
+			}
+			if(FD_ISSET(osd,&readfds)){
+				 recvo = recv(osd,obuff,sizeof(obuff),MSG_DONTWAIT);
+				if(recvo <= 0){
+					printf("Host disconnected\n");
+					observers[i].sd = 0;
+					close(osd);
+				}
+				if(recvo > 0){
+					printf("we got: %s\n",obuff );
+				}
+			}
+
+
+		}
+	}
+}
+
+
+
+int name_check(char* username, int length,int psd){
+	char newcheck = 'I';
+	for(int i = 0; i < length; i++){
+		if(!(isdigit(username[i]) || isalpha(username[i]) || username[i] == '_')){
+			send(psd,&newcheck,1,0);
+			return 3;
+		}
+	}
+	for(int i = 0; i < MAX; i++){
+		if(strcmp(username,participants[i].username) == 0){
+			newcheck = 'T';
+			send(psd,&newcheck,1,0);
+
+			return 2;
+		}
+	}
+	newcheck = 'Y';
+	send(psd,&newcheck,1,0);
+	return 1;
+
+}
+
+//finding an open spot to add a new particpant and for observers also, there may be holes we need to fill
+void addto_participants(int sd){
+	char verify = 'N';
+	for(int i = 0; i < MAX; i++ ){
+		if( participants[i].sd == 0 && participants[i].connected == 0){
+			participants[i].sd = sd;
+			participants[i].connected = 1;
+			printf("added particpant with sd %d to position %d\n",sd, i );
+			verify = 'Y';
+			send(sd,&verify,1,0);
+			break;
+		}
+	}
+	if(verify == 'N'){
+		send(sd,&verify,1,0);
+		close(sd);
+	}
+
+
+}
+void addto_observers(int sd){
+	for(int i = 0; i < MAX; i++ ){
+		if( observers[i].sd == 0){
+			observers[i].sd = sd;
+			printf("added observer with sd %d to position %d\n",sd, i );
+			printf("%d\n",observers[i].sd );
+			break;
+		}
+	}
+}
+
+//setting our default values
+void initialize_arrays(){
+	char tempp[16];
+	char tempo[16];
+
+	for(int i = 0; i < MAX; i++ ){
+		memset(tempp,0,sizeof(tempp));
+		memset(tempp,0,sizeof(tempo));
+		participants[i].sd = 0;
+		participants[i].connected = 0;
+		//participants[i].username = tempp;
+		strcpy(participants[i].username,"");
+		observers[i].sd = 0;
+		observers[i].connected = 0;
+	//	observers[i].username = tempo;
+		strcpy(observers[i].username,"");
+	}
+}

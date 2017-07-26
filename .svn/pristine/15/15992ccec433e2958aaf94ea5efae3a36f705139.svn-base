@@ -1,0 +1,4 @@
+1.I’m being asked to create a pseudo chat room with the added ability of being able to send private messages to specific users. Participants and observers will connect to a server, after a username is negotiated, the participant will be paired with an observer which more or less works as the participant's display, but the participant isn’t required to have an observer if the observer disconnects. The sockets will be monitored using select on the server side and deliver messages immediately immediately.
+2. Nope, not that I could find. 
+3. The participant observer interaction seems like it could be a bit tricky as in dealing with private messages.
+4. Demo lab, the book, and a lot of man pages.
